@@ -95,5 +95,3 @@ pgrun: 2 test files in 2 groups (by file size)
 1 runs, 3 assertions, 0 failures, 0 errors, 0 skips
 pgrun: deleted 2 branch(es) in 1000 ms
 ```
-
-A screenshot from a real GitHub-hosted run will be added when v1.0.0 is published.

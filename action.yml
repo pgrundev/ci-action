@@ -1,8 +1,7 @@
 name: PGRun CI
 description: >-
-  Test every pull request against its own disposable, production-like
-  PostgreSQL database: sanitized production data on a copy-on-write PGX
-  branch, migrations and data-loss checks, automatic cleanup.
+  Per-PR production-like PostgreSQL: a sanitized copy-on-write branch,
+  migration and data-loss checks, automatic cleanup.
 author: PGRun
 branding:
   icon: database

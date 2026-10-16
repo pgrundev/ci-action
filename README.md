@@ -11,7 +11,7 @@ On every pull request, PGRun CI:
 
 Your production database is never touched, and pull request code never sees a production credential.
 
-> Status: **v1 in review**. Rails is the first supported framework.
+> Status: **v1**. Rails is the first supported framework.
 
 ## Production-like CI in 3 steps
 
@@ -45,13 +45,15 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: pgrundev/ci-action@v1
         with:
           token: ${{ secrets.PGRUN_API_TOKEN }}
           mode: production-like
 ```
+
+`@v1` follows the latest v1 release. To pin an exact, immutable version instead, use the release's full commit SHA, which the [release page](https://github.com/pgrundev/ci-action/releases) lists: `uses: pgrundev/ci-action@<full commit sha>  # v1.0.0`. See [versioning](docs/versioning.md).
 
 That's all. There are no scripts to copy, no Ruby helpers and no database configuration.
 
