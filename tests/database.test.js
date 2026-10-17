@@ -272,6 +272,7 @@ test('quota: waits, gives back a partial hold, never reuses a name, then fails a
   assert.match(r.out, /no capacity for 2 branch\(es\) after 30s/);
   assert.strictEqual(new Set(api.created).size, api.created.length, 'names never reused');
   assert.deepStrictEqual(api.deleted.sort(), api.created.sort(), 'every partial hold given back');
+  assert.ok(!/never created/.test((await run('post.js', dir, api)).out));
   api.server.close();
 });
 

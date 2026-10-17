@@ -257,6 +257,7 @@ class Ledger {
   constructor(file, base) { this.file = file; this.data = base; }
   static path(id) { return path.join(process.env.RUNNER_TEMP || require('os').tmpdir(), 'pgrun-database', `${id}.json`); }
   add(name) { this.data.names.push(name); this.write(); }
+  remove(names) { this.data.names = this.data.names.filter((n) => !names.includes(n)); this.write(); }
   write() {
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(this.file, JSON.stringify(this.data), { mode: 0o600 });
@@ -288,6 +289,8 @@ async function createBranches(api, project, i, ledger, deadline) {
     ledger.add(name);
     const r = await api('POST', `/api/v1/projects/${enc(project)}/branches`, body(name));
     if (r.status === 201) { held.push(name); continue; }
+    // A 4xx answer is a refusal: nothing was created under that name.
+    if (r.status >= 400 && r.status < 500) ledger.remove([name]);
     const msg = message(r);
     const retryable = (r.status === 422 && QUOTA.test(msg)) || (r.status === 409 && r.json.error === 'template_not_ready') ||
       (r.status === 422 && /being refreshed/.test(msg));
@@ -298,7 +301,8 @@ async function createBranches(api, project, i, ledger, deadline) {
     if (waited === 0) log(`waiting for capacity (up to ${i.capacityWait}s): ${msg}`);
     // Holding part of what we need only blocks other runs: give it back.
     if (held.length > 0) {
-      await Promise.all(held.map((n) => deleteBranch(api, project, n)));
+      const results = await Promise.all(held.map((n) => deleteBranch(api, project, n)));
+      ledger.remove(held.filter((_, n) => results[n] !== 'failed'));
       held = [];
     }
     const s = 10 + Math.floor(Math.random() * 11);
