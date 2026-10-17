@@ -43,6 +43,8 @@ function stub(opts = {}) {
       }
       if (u.pathname === '/api/v1/projects/shop/branches' && req.method === 'POST') {
         const b = JSON.parse(body);
+        s.posts = (s.posts || 0) + 1;
+        if (s.failPosts > 0) { s.failPosts -= 1; return send(503, { error: 'unavailable' }); }
         if (live() >= s.quota) return send(422, { error: `branch quota reached (${live()}/${s.quota} live branches) — delete a branch` });
         s.seq += 1;
         const row = { name: b.name, ttl: b.ttl, template: b.template, polls: 0, n: s.seq, deleted: false };
@@ -217,6 +219,8 @@ test('refusals before any API call: no token (fork PR), pull_request_target, for
     [{}, job({ repository: { private: false } }), /repository is public/],
     [{ 'INPUT_ENV-NAME': 'PATH' }, job(), /env-name PATH is not allowed/],
     [{ 'INPUT_ENV-NAME': 'NODE_OPTIONS' }, job(), /not allowed/],
+    [{ 'INPUT_ENV-NAME': 'path' }, job(), /not allowed/],
+    [{}, job({ repository: { private: true }, pull_request: { head: { repo: null }, base: { repo: { full_name: 'acme/shop' } } } }), /fork/],
     [{ INPUT_TTL: '24h' }, job(), /ttl must be 1h or 6h/],
     [{ INPUT_BRANCHES: '17' }, job(), /branches must be 1\.\.16/],
     [{ INPUT_DATA: 'full' }, job(), /data must be/],
@@ -324,4 +328,52 @@ test('schema-only: a failed template build fails without creating branches', asy
   assert.match(r.out, /failed to build: boom/);
   assert.strictEqual(api.created.length, 0);
   api.server.close();
+});
+
+test('post ignores a ledger planted by a later step: another URL, another owner, foreign names', async () => {
+  const api = await stub();
+  const dir = job();
+  const r = await run('main.js', dir, api);
+  assert.strictEqual(r.code, 0, r.out);
+  const ledgers = path.join(dir, 'temp', 'pgrun-database');
+  const real = JSON.parse(fs.readFileSync(path.join(ledgers, fs.readdirSync(ledgers)[0]), 'utf8'));
+  // Same owner but a foreign branch name, and a ledger with another owner.
+  fs.writeFileSync(path.join(ledgers, 'aaaaaaaaaaaaaaaa.json'), JSON.stringify({ ...real, names: ['main', 'dev-branch'], apiUrl: 'https://evil.example' }));
+  fs.writeFileSync(path.join(ledgers, 'bbbbbbbbbbbbbbbb.json'), JSON.stringify({ owner: 'f'.repeat(32), project: 'shop', names: ['ci-db-other-1'] }));
+  const p = await run('post.js', dir, api);
+  assert.strictEqual(p.code, 0, p.out);
+  assert.deepStrictEqual(api.deleted, api.created, 'only its own recorded branch');
+  assert.ok(api.auth.every((a) => a === 'Bearer pgrun_ci_0123456789abcdef'));
+  assert.ok(!JSON.stringify(real).includes('pgrun_ci_'), 'the ledger never holds the token');
+  api.server.close();
+});
+
+test('a create is never retried: a 5xx fails the step without a second POST', async () => {
+  const api = await stub();
+  api.failPosts = 1;
+  const dir = job();
+  const r = await run('main.js', dir, api);
+  assert.strictEqual(r.code, 1, r.out);
+  assert.strictEqual(api.posts, 1);
+  assert.match(r.out, /creating a branch failed \(503\)/);
+  api.server.close();
+});
+
+test('on Actions, sanitized data fails closed without a readable event payload', async () => {
+  const api = await stub();
+  const dir = job();
+  fs.writeFileSync(path.join(dir, 'event.json'), 'not json');
+  const r = await run('main.js', dir, api, {}, { GITHUB_ACTIONS: 'true' });
+  assert.strictEqual(r.code, 1, r.out);
+  assert.match(r.out, /cannot read the GitHub event payload/);
+  assert.strictEqual(api.created.length, 0);
+  const s = await run('main.js', dir, api, { data: 'schema-only' }, { GITHUB_ACTIONS: 'true' });
+  assert.strictEqual(s.code, 0, s.out);
+  await run('post.js', dir, api);
+  api.server.close();
+});
+
+test('a server message cannot inject a workflow command', async () => {
+  const lib = require('../database/lib');
+  assert.strictEqual(lib.sanitize('quota\n::add-mask::x\r\n::stop-commands::y'), 'quota ::add-mask::x ::stop-commands::y');
 });

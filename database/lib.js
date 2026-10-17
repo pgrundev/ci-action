@@ -13,7 +13,7 @@ const crypto = require('crypto');
 
 const VERSION = '1.1.0';
 const MAX_BRANCHES = 16;
-const RESERVED_ENV = /^(GITHUB_|RUNNER_|ACTIONS_|INPUT_|STATE_|LD_|DYLD_)|^(PATH|HOME|SHELL|ENV|BASH_ENV|NODE_OPTIONS|NODE_PATH|PGRUN_API_TOKEN)$/;
+const RESERVED_ENV = /^(GITHUB_|RUNNER_|ACTIONS_|INPUT_|STATE_|LD_|DYLD_|GIT_|NODE_|NPM_|PYTHON|RUBY|PERL|JAVA_|PG)|^(PATH|HOME|SHELL|ENV|BASH_ENV|CI|TMPDIR|TEMP|TMP|HTTPS?_PROXY|NO_PROXY|ALL_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|CURL_CA_BUNDLE|PGRUN_API_TOKEN)$/i;
 
 class Failure extends Error {}
 
@@ -48,6 +48,7 @@ const summary = (md) => { if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync
 function sanitize(text) {
   return String(text ?? '')
     .replace(/postgres(ql)?:\/\/\S+/gi, '<url>')
+    .replace(/\s+/g, ' ') // one line: a server message can never start a workflow command
     .replace(/pgrun_(ci_)?[0-9a-f]{8,}/gi, '<token>')
     .slice(0, 500);
 }
@@ -68,7 +69,10 @@ function apiUrl() {
 function client(base, token) {
   return async function api(method, p, body) {
     let lastErr;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // A create is never retried: a lost response would leave a branch this
+    // step does not know it owns. Reads and deletes are idempotent.
+    const tries = method === 'POST' ? 1 : 3;
+    for (let attempt = 1; attempt <= tries; attempt++) {
       try {
         const res = await fetch(base + p, {
           method,
@@ -82,13 +86,13 @@ function client(base, token) {
           body: body ? JSON.stringify(body) : undefined,
           signal: AbortSignal.timeout(30000),
         });
-        if (res.status >= 500 && attempt < 3) { await pause(attempt * 2); continue; }
+        if (res.status >= 500 && attempt < tries) { await pause(attempt * 2); continue; }
         let json = {};
         try { json = await res.json(); } catch { /* empty or not JSON */ }
         return { status: res.status, json };
       } catch (e) {
         lastErr = e;
-        if (attempt < 3) await pause(attempt * 2);
+        if (attempt < tries) await pause(attempt * 2);
       }
     }
     throw new Failure(`cannot reach the PGRun API at ${base} (${sanitize(lastErr && lastErr.message)})`);
@@ -144,10 +148,16 @@ function checkEvent(i) {
     throw new Failure('refusing to run on pull_request_target: it would hand pull-request code the PGRun token. Use pull_request.');
   }
   let payload = {};
-  try { payload = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')); } catch { /* not on Actions */ }
+  try { payload = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')); } catch { payload = null; }
   if (i.data !== 'sanitized') return;
+  // Fail closed: on Actions, sanitized data needs an event the guards can read.
+  if (!payload) {
+    if (process.env.GITHUB_ACTIONS === 'true') throw new Failure('cannot read the GitHub event payload, so the fork and public-repository checks cannot run — refusing sanitized data.');
+    payload = {};
+  }
   const pr = payload.pull_request;
-  if (pr && pr.head && pr.head.repo && pr.base && pr.base.repo && pr.head.repo.full_name !== pr.base.repo.full_name) {
+  // A deleted fork has head.repo null: still a fork.
+  if (pr && (!pr.head || !pr.head.repo || !pr.base || !pr.base.repo || pr.head.repo.full_name !== pr.base.repo.full_name)) {
     throw new Failure('refusing sanitized data for a pull request from a fork: its code would run against the sanitized copy. Use data: schema-only for fork pull requests.');
   }
   if (payload.repository && payload.repository.private === false && i.allowPublic !== 'true') {
@@ -258,10 +268,19 @@ class Ledger {
   static path(id) { return path.join(process.env.RUNNER_TEMP || require('os').tmpdir(), 'pgrun-database', `${id}.json`); }
   add(name) { this.data.names.push(name); this.write(); }
   remove(names) { this.data.names = this.data.names.filter((n) => !names.includes(n)); this.write(); }
-  write() {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(this.file, JSON.stringify(this.data), { mode: 0o600 });
+  write() { Ledger.save(this.file, this.data); }
+  // Atomic: a cancel mid-write never leaves a half-written ledger.
+  static save(file, data) {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
+    fs.renameSync(tmp, file);
   }
+  // Which token and API a ledger belongs to, without storing either: post
+  // only acts on ledgers its own token wrote, and only against its own
+  // validated api-url — never a URL read back from a file a later step of
+  // the job could have rewritten.
+  static owner(token, url) { return crypto.createHash('sha256').update(`${url}\n${token}`).digest('hex').slice(0, 32); }
 }
 
 async function deleteBranch(api, project, name) {
@@ -349,7 +368,7 @@ async function main() {
     api = client(i.apiUrl, i.token);
     const ctx = await context(api, i);
     const { project, ageH, pv } = checkGates(ctx, i);
-    ledger = new Ledger(Ledger.path(id), { apiUrl: i.apiUrl, project, prefix: namePrefix(), names: [] });
+    ledger = new Ledger(Ledger.path(id), { owner: Ledger.owner(i.token, i.apiUrl), project, prefix: namePrefix(), names: [] });
     ledger.write();
     const deadline = Date.now() + i.readyTimeout * 1000;
     if (i.data === 'schema-only') await ensureTemplate(api, project, i, deadline);
@@ -401,9 +420,9 @@ async function main() {
   } catch (e) {
     // Give back what was created; post deletes whatever is still recorded.
     if (ledger && api) {
-      await Promise.all(ledger.data.names.map((n) => deleteBranch(api, ledger.data.project, n)));
-      ledger.data.names = [];
-      ledger.write();
+      const names = ledger.data.names;
+      const results = await Promise.all(names.map((n) => deleteBranch(api, ledger.data.project, n)));
+      ledger.remove(names.filter((_, n) => results[n] === 'deleted' || results[n] === 'absent'));
     }
     if (e instanceof Failure) { error(e.message); process.exitCode = 1; return; }
     error(`unexpected failure: ${sanitize(e && e.message)}`);
@@ -430,21 +449,27 @@ async function post() {
   const total = pending.reduce((n, l) => n + l.data.names.length, 0);
   if (!token) { warn(`no token to delete ${total} branch(es); PGRun deletes them at their TTL`); return; }
   mask(token);
+  let base;
+  try { base = apiUrl(); } catch (e) { warn(`${e.message}; PGRun deletes the branches at their TTL`); return; }
+  const owner = Ledger.owner(token, base);
+  const mine = pending.filter((l) => l.data.owner === owner && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(l.data.project || ''));
+  if (!mine.length) { log('nothing of this step\'s token to clean up'); return; }
   const t = Date.now();
   let deleted = 0; let absent = 0; const left = [];
-  for (const l of pending) {
-    const api = client(l.data.apiUrl, token);
+  const api = client(base, token);
+  for (const l of mine) {
+    // Only names this action generates: never an arbitrary branch.
+    l.data.names = l.data.names.filter((n) => /^ci-db-[a-z0-9-]{1,57}$/.test(n));
     const results = await Promise.all(l.data.names.map((n) => deleteBranch(api, l.data.project, n)));
     deleted += results.filter((r) => r === 'deleted').length;
     absent += results.filter((r) => r === 'absent').length;
-    // Refused = another step's token owns it: that step's own post deletes it.
     l.data.names = l.data.names.filter((_, n) => results[n] === 'failed' || results[n] === 'refused');
     left.push(...l.data.names);
-    if (l.data.names.length) fs.writeFileSync(l.file, JSON.stringify(l.data), { mode: 0o600 });
+    if (l.data.names.length) Ledger.save(l.file, l.data);
     else { try { fs.unlinkSync(l.file); } catch { /* gone */ } }
   }
   log(`deleted ${deleted} branch(es) in ${Date.now() - t} ms${absent ? ` (${absent} never created or already gone)` : ''}`);
-  if (left.length) warn(`could not delete ${left.join(', ')} with this step's token; another PGRun step of this job, or the branch TTL, deletes them`);
+  if (left.length) warn(`could not delete ${left.join(', ')}; PGRun deletes them at their TTL`);
   summary(`PGRun cleanup: ${deleted} branch(es) deleted${left.length ? `, ${left.length} left to their TTL` : ''}.\n`);
 }
 

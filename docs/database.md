@@ -187,7 +187,7 @@ The action deletes only the branches it created. It records their exact names be
 
 ## Security
 
-- **The token** is masked, sent only in a header, and only over HTTPS.
+- **The token** is masked, sent only in a header, only over HTTPS and only to `api-url` (default `https://app.pgrun.dev`). Change `api-url` only to a PGRun host you trust: the token goes wherever it points.
 - **URLs and passwords** are masked before anything can print them, including the percent-encoded and decoded forms of the password. GitHub masks exact strings only: a command that transforms the value (base64, splitting it) can still reveal it, so don't print connection details.
 - **Fork pull requests** get no secrets, so the step fails with a clear message. Add the `if:` above to skip those jobs. `data: sanitized` also refuses a fork pull request even when secrets are passed to it: its code would run against the sanitized copy. `schema-only` is allowed there.
 - **`pull_request_target`** is always refused: it would hand pull-request code the token.
