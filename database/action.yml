@@ -1,0 +1,84 @@
+name: PGRun Database
+description: >-
+  Disposable PostgreSQL for any stack: an isolated PGRun branch, DATABASE_URL
+  for your own steps, deleted when the job ends.
+author: PGRun
+branding:
+  icon: database
+  color: purple
+
+inputs:
+  token:
+    description: PGRun API token (a project CI token). Store it as the PGRUN_API_TOKEN secret.
+    required: true
+  project:
+    description: PGRun project name. Optional — a CI token belongs to exactly one project.
+    default: ""
+  data:
+    description: "sanitized (a branch of the project's Safe Copy: production-like, protected data) or schema-only (empty tables from a CI template, plus its seed)."
+    default: sanitized
+  template:
+    description: schema-only — the CI template's name. Created on first use; its seed is set by an account manager in PGRun.
+    default: ci
+  branches:
+    description: Number of isolated databases (1–16). With more than one, DATABASE_URL_1..N are set too.
+    default: "1"
+  ttl:
+    description: "Branch lifetime if this job's cleanup never runs (a dead runner): 1h or 6h."
+    default: 1h
+  engine:
+    description: "pgx (default: fail if a branch is not on PGX), postgres, or any."
+    default: pgx
+  env-name:
+    description: Environment variable that holds the connection URL in later steps of this job.
+    default: DATABASE_URL
+  export-env:
+    description: Set the URL in the environment of later steps. false = only the step outputs.
+    default: "true"
+  capacity-wait:
+    description: Seconds to wait for the project's branch quota before failing.
+    default: "600"
+  ready-timeout:
+    description: Seconds to wait for the branches (and a schema-only template build) to be ready.
+    default: "1200"
+  snapshot-max-hours:
+    description: sanitized — fail when the Safe Copy is older than this (0 = never).
+    default: "720"
+  allow-public-repository:
+    description: >-
+      sanitized data refuses to run in a public repository, whose Actions logs
+      anyone can read: your steps could print the sanitized data. Set true to accept that.
+    default: "false"
+  api-url:
+    description: PGRun API URL.
+    default: https://app.pgrun.dev
+
+outputs:
+  database-url:
+    description: Connection URL of the (first) branch. Masked in logs; use it only within this job.
+  branch-name:
+    description: Name of the (first) branch.
+  branches:
+    description: "JSON array of every branch: name, engine, host, port, database, username, expires_at, env — never a URL or password."
+  host:
+    description: Host of the (first) branch.
+  port:
+    description: Port of the (first) branch.
+  database:
+    description: Database name of the (first) branch.
+  username:
+    description: User of the (first) branch.
+  password:
+    description: Password of the (first) branch. Masked in logs.
+  engine:
+    description: Runtime of the (first) branch — pgx or postgres.
+  expires-at:
+    description: When PGRun deletes the branches if cleanup never runs (ISO 8601).
+  project:
+    description: The PGRun project the branches belong to.
+
+runs:
+  using: node24
+  main: main.js
+  post: post.js
+  post-if: always()

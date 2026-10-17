@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: shellcheck
         run: shellcheck -S warning lib/pgrun-ci tests/*.sh
+      - name: database action
+        run: node --test tests/database.test.js
       - name: python syntax
         run: python3 -m py_compile lib/pgrun_profile.py
       - name: profiler
