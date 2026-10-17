@@ -1,8 +1,33 @@
 # PGRun CI
 
-**Test your code against a production-like PostgreSQL database. Every pull request gets its own isolated database.**
+**Disposable PostgreSQL for any stack, any agent, any CI.** Every job gets its own isolated database — a copy-on-write branch of your sanitized production data, or an empty schema — and it is deleted when the job ends.
 
-On every pull request, PGRun CI:
+PGRun provides the database. You decide what to run.
+
+## Any stack: `pgrundev/ci-action/database`
+
+```yaml
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pgrundev/ci-action/database@v1
+        with:
+          token: ${{ secrets.PGRUN_API_TOKEN }}
+
+      # Your own commands. DATABASE_URL is set; the database is deleted when the job ends.
+      - run: npm ci && npx prisma migrate deploy && npm test
+```
+
+- `data: sanitized` (default) — a branch of the project's Safe Copy: production-like data, protected by your approved Protect policy.
+- `data: schema-only` — your schema with empty tables (plus the CI template's seed), for fast unit tests.
+- `branches: N` — N isolated databases: `DATABASE_URL_1..N` for parallel test workers.
+- Cleanup on success, failure and cancellation; the branch TTL (`1h`) covers a runner that dies.
+
+The action does nothing else: no framework detection, no migrations, no test runner. Full reference, outputs and examples for Rails, Django, Prisma and Go: **[docs/database.md](docs/database.md)**.
+
+## Rails preset: `pgrundev/ci-action`
+
+The root action is an optional, all-in-one preset for Rails. On every pull request it:
 1. Creates a copy-on-write PGX branch of your sanitized production data, in seconds.
 2. Runs your migrations on it.
 3. Checks that they didn't destroy data.
@@ -11,9 +36,9 @@ On every pull request, PGRun CI:
 
 Your production database is never touched, and pull request code never sees a production credential.
 
-> Status: **v1**. Rails is the first supported framework.
+> Status: **v1**. The preset supports Rails; for any other stack use `pgrundev/ci-action/database`.
 
-## Production-like CI in 3 steps
+## Rails: production-like CI in 3 steps
 
 1. **Connect PostgreSQL and approve Protect in PGRun.** Connect the database, review the data-protection policy (what is masked, faked or removed), and approve it. PGRun then builds the sanitized **Safe Copy**.
 2. **Add a CI token to GitHub.**
