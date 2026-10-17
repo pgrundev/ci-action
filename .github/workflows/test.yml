@@ -35,3 +35,32 @@ jobs:
         env:
           TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: bash tests/test_lifecycle.sh
+
+  # This repository is public: the database action's guards on a real runner.
+  # No secret here — a placeholder token is refused by the API (401) at most.
+  database-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - id: sanitized
+        continue-on-error: true
+        uses: ./database
+        with:
+          token: placeholder-not-a-token
+      - id: no-token
+        continue-on-error: true
+        uses: ./database
+        with:
+          token: ""
+      - id: schema-only
+        continue-on-error: true
+        uses: ./database
+        with:
+          token: placeholder-not-a-token
+          data: schema-only
+      - name: Every one refused, nothing exported
+        run: |
+          test "${{ steps.sanitized.outcome }}" = failure
+          test "${{ steps.no-token.outcome }}" = failure
+          test "${{ steps.schema-only.outcome }}" = failure
+          test -z "${DATABASE_URL:-}"
