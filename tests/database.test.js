@@ -44,6 +44,13 @@ function stub(opts = {}) {
       if (u.pathname === '/api/v1/projects/shop/branches' && req.method === 'POST') {
         const b = JSON.parse(body);
         s.posts = (s.posts || 0) + 1;
+        (s.bodies = s.bodies || []).push(b);
+        if (s.replayFirst && s.posts === 1) {
+          s.seq += 1;
+          s.branches.set(b.name, { name: b.name, ttl: b.ttl, template: b.template, polls: 0, n: s.seq, deleted: false });
+          s.created.push(b.name);
+          return send(200, { name: b.name, status: 'creating', replayed: true });
+        }
         if (s.failPosts > 0) { s.failPosts -= 1; return send(503, { error: 'unavailable' }); }
         if (live() >= s.quota) return send(422, { error: `branch quota reached (${live()}/${s.quota} live branches) — delete a branch` });
         s.seq += 1;
@@ -376,4 +383,29 @@ test('on Actions, sanitized data fails closed without a readable event payload',
 test('a server message cannot inject a workflow command', async () => {
   const lib = require('../database/lib');
   assert.strictEqual(lib.sanitize('quota\n::add-mask::x\r\n::stop-commands::y'), 'quota ::add-mask::x ::stop-commands::y');
+});
+
+// Sprint 2026-11 §1B: the engine is decided by the server BEFORE provisioning,
+// so the action must send it; the unique branch name is the idempotency key.
+test('create sends the engine and a request_id; engine any sends no engine', async () => {
+  const api = await stub();
+  const r = await run('main.js', job(), api, { project: 'shop', engine: 'pgx' });
+  assert.strictEqual(r.code, 0, r.out);
+  assert.ok(api.bodies.length >= 1);
+  for (const b of api.bodies) {
+    assert.strictEqual(b.engine, 'pgx');
+    assert.strictEqual(b.request_id, b.name);
+  }
+  const api2 = await stub({ engine: 'postgres' });
+  const r2 = await run('main.js', job(), api2, { project: 'shop', engine: 'any' });
+  assert.strictEqual(r2.code, 0, r2.out);
+  for (const b of api2.bodies) assert.strictEqual(b.engine, undefined);
+});
+
+test('a replayed create (200, replayed: true) counts as the branch it names', async () => {
+  const api = await stub();
+  api.replayFirst = true;
+  const r = await run('main.js', job(), api, { project: 'shop' });
+  assert.strictEqual(r.code, 0, r.out);
+  assert.strictEqual(api.posts, 1, 'no second POST after a replay');
 });
