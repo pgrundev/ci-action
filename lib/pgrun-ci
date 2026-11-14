@@ -840,7 +840,8 @@ main_run() {
   fi
   case "$mode" in production-like|fast) ;; *) die "mode must be production-like or fast (got: $mode)" ;; esac
   if [ "$mode" = production-like ] && [ "${PGRUN_IN_ALLOW_PUBLIC_REPOSITORY:-false}" != true ] \
-     && [ -f "${GITHUB_EVENT_PATH:-}" ] && [ "$(jq -r '.repository.private // empty' "$GITHUB_EVENT_PATH")" = false ]; then
+     && [ -f "${GITHUB_EVENT_PATH:-}" ] && [ "$(jq -r '.repository.private | if . == false then "false" else "" end' "$GITHUB_EVENT_PATH")" = false ]; then
+    # (jq's `// empty` turns false into empty, so `.repository.private // empty` never matched.)
     die "this repository is public: anyone can read its Actions logs, and production-like mode runs your migrations and tests on the sanitized copy, which they could print. Use a private repository, or set allow-public-repository: true to accept this."
   fi
   case "$engine" in pgx|postgres|any) ;; *) die "engine must be pgx, postgres or any" ;; esac
