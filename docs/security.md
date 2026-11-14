@@ -58,6 +58,7 @@ This is GitHub's model for every Actions secret, and no YAML condition changes i
 ## Supply chain
 
 - The pgrun CLI is downloaded from its GitHub release and checked against a SHA-256 pinned in the action. A mismatch stops the run before the CLI is unpacked.
+- Migration verification (`verify: true`) uses a pgrun CLI already on the runner. The action never downloads an unpinned one, and no release with `bot verify` is pinned yet. pgbot, when missing, comes from `pgrun bot install`, which verifies pgrun's pinned SHA-256. The migration runs under `env -u PGRUN_API_TOKEN`. Its output is redacted of URLs and the token, and printed between `::stop-commands::` markers so it cannot issue workflow commands.
 - `ruby/setup-ruby` is pinned by commit.
 - The action only sends the token to an `https://` API URL (or localhost, for tests).
 - The action itself should be pinned by commit SHA in security-sensitive repositories.

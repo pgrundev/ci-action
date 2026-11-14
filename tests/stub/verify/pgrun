@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Fake pgrun for tests/test_verify.sh: `bot status`, `bot install` and
+# `bot verify` only, no network. Records each call in $FAKE_DIR/calls (argv)
+# and $FAKE_DIR/env (whether the token was in its environment, never its value).
+#   FAKE_DOC     report template (__PROJECT__ is replaced); blocking, policy
+#                and the exit code are recomputed from --block-on like the CLI
+#   FAKE_EXIT    force this exit code      FAKE_RAW   print this instead of a report
+#   FAKE_OLD     a pgrun without `bot`     FAKE_PGBOT=missing   pgbot not installed
+#   FAKE_SLEEP   seconds before answering  FAKE_RUN_MIGRATION   run the command after --
+#   FAKE_LEAK    print the token and a URL on stderr
+set -euo pipefail
+dir="${FAKE_DIR:?}"
+printf '%s\n' "$*" >> "$dir/calls"
+echo "token_in_env=$([ -n "${PGRUN_API_TOKEN:-}" ] && echo yes || echo no)" >> "$dir/env"
+[ -n "${FAKE_OLD:-}" ] && [ "${1:-}" = bot ] && { echo "pgrun: unknown command \"bot\"" >&2; exit 64; }
+case "${1:-} ${2:-}" in
+  "version "*) echo "pgrun 0.6.0" ;;
+  "bot status")
+    if [ "${FAKE_PGBOT:-}" = missing ] && [ ! -e "$dir/pgbot-installed" ]; then echo '{"installed":false,"min_version":"0.9.0"}'
+    else echo '{"installed":true,"min_version":"0.9.0","binary":{"version":"0.9.2"}}'; fi ;;
+  "bot install") touch "$dir/pgbot-installed"; echo "installed pgbot 0.9.2" ;;
+  "bot verify")
+    shift 2
+    project=""; [ $# -gt 0 ] && [ "${1#-}" = "$1" ] && { project="$1"; shift; }
+    block_on="fail,dangerous,incomplete,error"; fail_on=critical; cmd=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --block-on) block_on="$2"; shift 2 ;;
+        --fail-on) fail_on="$2"; shift 2 ;;
+        --) shift; cmd=("$@"); break ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
+    if [ -n "${FAKE_RUN_MIGRATION:-}" ]; then
+      DATABASE_URL="postgres://verify:s3cretpw@branch.example/db" "${cmd[@]}" >&2 || true
+    fi
+    [ -n "${FAKE_LEAK:-}" ] && echo "debug: token=$PGRUN_API_TOKEN url=postgres://verify:s3cretpw@branch.example/db" >&2
+    echo "pgrun: verifying ${project:-default}" >&2
+    if [ -n "${FAKE_RAW+x}" ]; then printf '%s' "$FAKE_RAW"; exit "${FAKE_EXIT:-1}"; fi
+    doc=$(sed "s/__PROJECT__/${project:-default}/g" "${FAKE_DOC:?}" | jq -c --arg b "$block_on" --arg f "$fail_on" '
+      ($b | if . == "none" then [] else split(",") end) as $bl
+      | .policy = {fail_on: $f, block_on: $bl}
+      | .blocking = ([.categories[] | select(. as $c | $bl | index($c))] | length > 0)
+      | .exit = (if .blocking | not then 0 elif [.categories[] | select(. as $c | $bl | index($c)) | select(. != "error")] | length == 0 then 3 else 1 end)')
+    jq 'del(.exit)' <<< "$doc"
+    exit "${FAKE_EXIT:-$(jq -r '.exit' <<< "$doc")}" ;;
+  *) echo "fake pgrun: unsupported: $*" >&2; exit 64 ;;
+esac
