@@ -89,7 +89,7 @@ function client(base, token) {
         if (res.status >= 500 && attempt < tries) { await pause(attempt * 2); continue; }
         let json = {};
         try { json = await res.json(); } catch { /* empty or not JSON */ }
-        return { status: res.status, json };
+        return { status: res.status, json, retryAfter: res.headers.get('retry-after') };
       } catch (e) {
         lastErr = e;
         if (attempt < tries) await pause(attempt * 2);
@@ -319,7 +319,11 @@ async function createBranches(api, project, i, ledger, deadline) {
     // A 4xx answer is a refusal: nothing was created under that name.
     if (r.status >= 400 && r.status < 500) ledger.remove([name]);
     const msg = message(r);
-    const retryable = (r.status === 422 && QUOTA.test(msg)) || (r.status === 409 && r.json.error === 'template_not_ready') ||
+    // Admission control (server 2026-11-14, PGRUN_ADMISSION_CONTROL): 429 capacity_busy means the
+    // host is momentarily full and nothing was created; wait what the server asks (Retry-After),
+    // within capacity-wait. 503 capacity_unavailable stays fatal: no host can ever take it.
+    const busy = r.status === 429 && r.json && r.json.error === 'capacity_busy';
+    const retryable = busy || (r.status === 422 && QUOTA.test(msg)) || (r.status === 409 && r.json.error === 'template_not_ready') ||
       (r.status === 422 && /being refreshed/.test(msg));
     if (!retryable) throw new Failure(`creating a branch failed (${r.status}): ${msg}`);
     if (waited >= i.capacityWait) {
@@ -332,7 +336,10 @@ async function createBranches(api, project, i, ledger, deadline) {
       ledger.remove(held.filter((_, n) => results[n] !== 'failed'));
       held = [];
     }
-    const s = 10 + Math.floor(Math.random() * 11);
+    const asked = busy ? Number(r.retryAfter || (r.json && r.json.retry_after_s)) : NaN;
+    const s = Number.isFinite(asked) && asked > 0
+      ? Math.min(60, Math.max(5, Math.ceil(asked)))
+      : 10 + Math.floor(Math.random() * 11);
     await pause(s);
     waited += s;
   }
