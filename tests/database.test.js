@@ -52,6 +52,12 @@ function stub(opts = {}) {
           return send(200, { name: b.name, status: 'creating', replayed: true });
         }
         if (s.failPosts > 0) { s.failPosts -= 1; return send(503, { error: 'unavailable' }); }
+        if (s.busyPosts > 0) {
+          s.busyPosts -= 1;
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '15' });
+          return res.end(JSON.stringify({ error: 'capacity_busy', retry_after_s: 15, message: 'host is busy' }));
+        }
+        if (s.unavailablePosts) return send(503, { error: 'capacity_unavailable', message: 'no eligible host' });
         if (live() >= s.quota) return send(422, { error: `branch quota reached (${live()}/${s.quota} live branches) — delete a branch` });
         s.seq += 1;
         const row = { name: b.name, ttl: b.ttl, template: b.template, polls: 0, n: s.seq, deleted: false };
@@ -408,4 +414,22 @@ test('a replayed create (200, replayed: true) counts as the branch it names', as
   const r = await run('main.js', job(), api, { project: 'shop' });
   assert.strictEqual(r.code, 0, r.out);
   assert.strictEqual(api.posts, 1, 'no second POST after a replay');
+});
+
+test('admission: 429 capacity_busy waits Retry-After and retries; 503 capacity_unavailable fails at once', async () => {
+  const api = await stub();
+  api.busyPosts = 2;
+  const dir = job();
+  const r = await run('main.js', dir, api, { 'project': 'shop' });
+  assert.strictEqual(r.code, 0, r.out);
+  assert.strictEqual(api.posts, 3, 'two busy answers, then created');
+  assert.strictEqual(api.created.length, 1, 'nothing extra was created');
+  assert.match(r.out, /waiting for capacity/);
+
+  const api2 = await stub();
+  api2.unavailablePosts = true;
+  const r2 = await run('main.js', job(), api2, { 'project': 'shop' });
+  assert.notStrictEqual(r2.code, 0);
+  assert.strictEqual(api2.posts, 1, 'a permanent refusal is not retried');
+  assert.match(r2.out, /creating a branch failed \(503\)/);
 });
