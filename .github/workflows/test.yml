@@ -27,6 +27,8 @@ jobs:
         run: node --test tests/database.test.js
       - name: migration verification (fake pgrun)
         run: bash tests/test_verify.sh
+      - name: public-repository guard
+        run: bash tests/test_public_guard.sh
       - name: python syntax
         run: python3 -m py_compile lib/pgrun_profile.py
       - name: profiler
