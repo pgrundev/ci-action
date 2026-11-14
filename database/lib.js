@@ -301,13 +301,21 @@ async function createBranches(api, project, i, ledger, deadline) {
   let held = [];
   let seq = 0;
   let waited = 0;
-  const body = (name) => ({ name, ttl: i.ttl, ...(i.data === 'schema-only' ? { template: i.template } : {}) });
+  // Sprint 2026-11 §1B: the engine travels WITH the create, so the server
+  // decides it before provisioning (no create-then-check). The branch name is
+  // unique per run/attempt/sequence, so it doubles as the idempotency key: a
+  // retried POST returns the branch the first one made (200, replayed).
+  const body = (name) => ({
+    name, ttl: i.ttl, request_id: name,
+    ...(i.engine !== 'any' ? { engine: i.engine } : {}),
+    ...(i.data === 'schema-only' ? { template: i.template } : {}),
+  });
   while (held.length < i.branches) {
     seq += 1; // never reuse a name: a released one may still be deleting
     const name = `${ledger.data.prefix}-${seq}`;
     ledger.add(name);
     const r = await api('POST', `/api/v1/projects/${enc(project)}/branches`, body(name));
-    if (r.status === 201) { held.push(name); continue; }
+    if (r.status === 201 || (r.status === 200 && r.json && r.json.replayed)) { held.push(name); continue; }
     // A 4xx answer is a refusal: nothing was created under that name.
     if (r.status >= 400 && r.status < 500) ledger.remove([name]);
     const msg = message(r);
