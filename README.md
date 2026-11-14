@@ -177,6 +177,16 @@ Your whole test suite, in parallel. Each worker gets its own empty branch with t
 
 Don't point your ordinary suite at production-like data: most tests assume empty tables. Write tests for populated data, such as "every model loads its newest rows" or "this report runs", and run them here.
 
+## Migration verification with PgBot (opt-in)
+
+Set `verify: true` to verify the migration before the run. `pgrun bot verify` runs it on its own disposable PostgreSQL branch of the Safe Copy, and on a PGX branch too. PgBot then reviews the schema change: table rewrites, blocking index builds, `SET NOT NULL`, drops, renames, type changes.
+
+The summary separates the outcomes: success, informational warnings, dangerous operations (with PgBot's advice), confirmed failures, unsupported on PGX, incomplete reviews and infrastructure errors. `verify-block-on` chooses which of them fail the step; by default `fail,dangerous,incomplete,error`.
+
+It verifies one migration against the Safe Copy baseline. It does not detect conflicts between parallel migrations from different pull requests or agents against a changing production schema.
+
+Inputs, verdicts, outputs and how to get the CLI: [docs/verify.md](docs/verify.md).
+
 ## Options
 
 | Input | Default | |
@@ -198,9 +208,16 @@ Don't point your ordinary suite at production-like data: most tests assume empty
 | `ttl` | `1h` | Branch lifetime if a runner dies. PGRun caps CI-token branches at `6h`. |
 | `snapshot-warn-hours` / `snapshot-max-hours` | `24` / `720` | Warn, then fail, on an old Safe Copy. |
 | `profile-max-exact-rows` / `profile-budget` / `profile-statement-timeout` | `5000000` / `900` / `120` | Bounds for the data checks. |
-| `allow-public-repository` | `false` | Production-like mode refuses to run in a public repository, whose logs anyone can read. |
+| `allow-public-repository` | `false` | Production-like mode refuses to run in a public repository, whose logs anyone can read. Verification refuses as well. |
+| `verify` | `false` | `true`: PgBot migration verification before the run ([docs/verify.md](docs/verify.md)). |
+| `verify-command` | the migrate command | The command verified. |
+| `verify-compare-pgx` | `true` | Also run it on PGX and compare schemas. |
+| `verify-fail-on` | `critical` | Finding severity that counts as dangerous: `critical`, `warning`, `none`. |
+| `verify-block-on` | `fail,dangerous,incomplete,error` | Verdict categories that fail the step, or `none`. |
 
-Output: `result` (`PASS` or `FAIL`).
+Outputs:
+- `result`: `PASS` or `FAIL`.
+- With `verify: true`: `verify-verdict`, `verify-blocking`, `verify-categories` and `verify-report` (the path of the JSON report).
 
 Services and system packages your app needs (Redis, `libvips`, …) stay ordinary steps in your job before this one. The action uses whatever the job provides.
 

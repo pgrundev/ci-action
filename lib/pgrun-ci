@@ -573,6 +573,244 @@ write_summary() {
   } >> "$summary"
 }
 
+# ------------------------------------------------------------------ verify
+# `pgrun-ci verify`: opt-in (verify: true). Runs `pgrun bot verify --json`,
+# which makes its own disposable branches of the Safe Copy (PostgreSQL, plus
+# PGX with verify-compare-pgx), runs the migration there, has pgbot review the
+# schema change and deletes its branches. This step only reads the report.
+# Everything it writes is in its own mktemp directory, so several runs on one
+# runner never share a file, and it never touches the run step's state.
+VERIFY_CATEGORIES="fail dangerous unsupported incomplete error warning"
+VERIFY_DEFAULT_BLOCK_ON="fail,dangerous,incomplete,error"
+# The first pgrun release with `bot verify` (pgrun-verify 1.x). Not released
+# yet: until its version and checksums are pinned here, the CLI must already
+# be on the runner (see docs/verify.md). Nothing unpinned is ever downloaded.
+VERIFY_CLI_VERSION=""
+verify_cli_sha256() { case "$1" in *) echo "" ;; esac; }
+
+# Redacts URLs and the token from a whole stream (sanitize keeps 40 lines).
+redact() {
+  local s; s=$(sed -E 's#postgres(ql)?://[^ ]+#<url>#g; s/pgrun_(ci_)?[0-9a-f]{8,}/<token>/g')
+  [ -n "${PGRUN_API_TOKEN:-}" ] && s="${s//"$PGRUN_API_TOKEN"/<token>}"
+  printf '%s\n' "$s"
+}
+
+verify_in_list() { [[ ",$2," == *",$1,"* ]]; }
+
+# A refusal (guard or bad input): fails the step whatever block-on says.
+verify_refuse() {
+  echo "::error title=PGRun verify::$*"
+  { echo "verdict=error"; echo "blocking=true"; echo "categories=error"; echo "report="; } >> "${GITHUB_OUTPUT:-/dev/null}"
+  { echo "## PGRun migration verification — refused"; echo; echo "> $*"; echo; } >> "$summary"
+  exit 1
+}
+
+# The report for a failure that left no pgrun-verify document: category error.
+verify_synth() {   # <reason>
+  jq -n --arg project "$project_in" --arg reason "$1" --arg fail_on "$v_fail_on" --arg block_on "$v_block_on" '
+    ($block_on | if . == "none" then [] else split(",") end) as $b |
+    {kind: "pgrun-verify", version: "1.1.0", source: "pgrun-ci", project: $project,
+     verdict: "error", categories: ["error"], blocking: ($b | index("error") != null),
+     policy: {fail_on: $fail_on, block_on: $b}, reasons: [$reason],
+     summary: {critical: 0, warning: 0, info: 0, new_lint: 0}, cleanup: []}' > "$v_report"
+}
+
+verify_cli() {   # a pgrun with `bot verify` and a compatible pgbot; else the reason in $v_dir/why
+  local why="$v_dir/why"
+  if ! { command -v pgrun > /dev/null && pgrun bot status --json > "$v_dir/bot.json" 2>/dev/null \
+         && jq -e 'type == "object" and has("installed")' "$v_dir/bot.json" > /dev/null 2>&1; }; then
+    if [ -z "$VERIFY_CLI_VERSION" ] || [ "$(uname -s)" != Linux ]; then
+      echo "no pgrun CLI with \`bot verify\` on this runner. Install pgrun (with PgBot) in a step before this one; the action downloads only a release whose SHA-256 it pins, and none is pinned yet." > "$why"
+      return 1
+    fi
+    local arch name
+    case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) echo "unsupported runner architecture $(uname -m)" > "$why"; return 1 ;; esac
+    name="pgrun_${VERIFY_CLI_VERSION}_linux_${arch}.tar.gz"
+    mkdir -p "$v_dir/bin"
+    curl -fsSL --retry 3 -o "$v_dir/$name" "https://github.com/pgrundev/pgrun-cli/releases/download/v$VERIFY_CLI_VERSION/$name" \
+      || { echo "could not download the pgrun CLI $VERIFY_CLI_VERSION" > "$why"; return 1; }
+    echo "$(verify_cli_sha256 "linux_$arch")  $v_dir/$name" | sha256sum -c --quiet - > /dev/null 2>&1 \
+      || { echo "pgrun CLI checksum mismatch — refusing to run it" > "$why"; return 1; }
+    tar -xzf "$v_dir/$name" -C "$v_dir/bin" pgrun
+    export PATH="$v_dir/bin:$PATH"
+    pgrun bot status --json > "$v_dir/bot.json" 2>/dev/null || { echo "pgrun $VERIFY_CLI_VERSION has no \`bot\` command" > "$why"; return 1; }
+  fi
+  if [ "$(jq -r '.installed' "$v_dir/bot.json")" != true ]; then
+    log "installing pgbot (pgrun bot install: pinned release, SHA-256 verified by pgrun)"
+    pgrun bot install > "$v_dir/bot-install.log" 2>&1 \
+      || { echo "pgbot could not be installed: $(redact < "$v_dir/bot-install.log" | tail -3 | tr '\n' ' ')" > "$why"; return 1; }
+  fi
+}
+
+verify_on_signal() {
+  trap '' INT TERM
+  echo "::warning title=PGRun verify::cancelled — pgrun deletes its verification branches"
+  # pgrun deletes its branches on a signal: give it the time to.
+  [ -n "$CHILD" ] && { kill -TERM "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null || true; }
+  exit 130
+}
+
+# Markdown for the job summary, from a pgrun-verify report.
+VERIFY_SUMMARY_JQ='
+def md: tostring | gsub("[\r\n]+"; " ") | gsub("\\|"; "\\|") | gsub("<"; "&lt;");
+def secs: if . == null then "—" elif . < 10000 then "\((. / 100 | floor) / 10)s" else "\(. / 1000 | floor)s" end;
+def catlabel: {pass: "✅ Success", warning: "ℹ️ Informational warnings", dangerous: "⚠️ Dangerous operations",
+  fail: "❌ Confirmed failure", unsupported: "🧪 Unsupported on PGX", incomplete: "❓ Incomplete",
+  error: "🛠️ Infrastructure error"}[.] // (. | md);
+def meaning: {
+  fail: "The migration exited non-zero on canonical PostgreSQL: it fails in production too.",
+  dangerous: "The schema review found operations at or above fail-on `\($fail_on)` — a table rewrite, a blocking index build, SET NOT NULL, a drop, a rename or a type change. They can lock or break production; see each finding and its advice.",
+  unsupported: "PGX could not run the migration, produced a different schema, or was unavailable for the project. PostgreSQL itself was fine.",
+  incomplete: "The schema review or lint could not run, so the migration was not reviewed. This is not a pass.",
+  error: "An infrastructure or tool error stopped the verification (a branch never ready, an API failure, the CLI missing or its report unreadable). Nothing is known about the migration.",
+  warning: "Informational only: findings below fail-on, new lint findings, or a verification branch that could not be deleted.",
+  pass: "The migration ran on PostgreSQL and the schema review found nothing at or above fail-on."}[.] // "";
+def run(r): if r == null then "—" else [
+  (if r.branch then "branch `\(r.branch | md)`" else empty end),
+  (if r.engine then "on \(r.engine | md)" else empty end),
+  (if r.ready_ms != null then "ready in \(r.ready_ms | secs)" else empty end),
+  (if r.migration_exit_code != null then "migration exit \(r.migration_exit_code) in \(r.migrate_ms | secs)" else empty end),
+  (if r.unavailable != null then "unavailable: \(r.unavailable | (.message? // .error? // .) | if type == "string" then . else tojson end | md)" else empty end),
+  (if (r.error // "") != "" then "error: \(r.error | md)" else empty end)] | join(" · ") end;
+(.categories // []) as $cats | (.policy.block_on // []) as $block |
+"## PGRun migration verification — \(.verdict | catlabel)\(if .blocking then " (blocking)" else "" end)",
+"",
+"| | |", "|---|---|",
+"| Project | \(if (.project // "") == "" then "the token'"'"'s project" else (.project | md) end) |",
+"| Verdict | **\(.verdict | md)** |",
+"| Categories | \($cats | map(catlabel) | join(", ")) |",
+"| Blocking | \(if .blocking then "yes — \($cats | map(select(. as $c | $block | index($c))) | join(", "))" else "no" end) |",
+"| Policy | fail-on `\(.policy.fail_on // $fail_on | md)` · block-on `\($block | if length == 0 then "none" else join(",") end | md)` |",
+"| PostgreSQL run | \(run(.verification)) |",
+(if .pgx != null or .pgx_compatible != null then "| PGX run | \(run(.pgx))\(if .pgx_compatible == true then " · compatible" elif .pgx_compatible == false then " · **not compatible**" else "" end) |" else empty end),
+(if (.schema_review_skipped // "") != "" then "| Schema review | skipped: \(.schema_review_skipped | md) |"
+ elif .schema_review != null then "| Schema review | \(.schema_review.summary // .summary | "\(.critical // 0) critical, \(.warning // 0) warning, \(.info // 0) info") |" else empty end),
+(if (.new_lint_findings // []) | length > 0 then "| New lint findings | \(.new_lint_findings | length) |" else empty end),
+(if .pgbot_version then "| pgbot | \(.pgbot_version | md) |" else empty end),
+(if .duration_ms != null then "| Duration | \(.duration_ms | secs) |" else empty end),
+"",
+($cats[] | "- **\(catlabel)** — \(meaning)"),
+"",
+(if (.reasons // []) | length > 0 then ("**Reasons**", "", (.reasons[] | "- \(md)"), "") else empty end),
+(if (.schema_review.findings // []) | length > 0 then (
+  "### Schema review findings", "",
+  "| Severity | Check | Object | What happens | Advice |", "|---|---|---|---|---|",
+  (.schema_review.findings[] | "| \(.severity | md) | `\(.id | md)` | \(.object // "" | md) | \(.detail // "" | md) | \(.advice // "" | md) |"),
+  "") else empty end),
+(if (.new_lint_findings // []) | length > 0 then (
+  "### New lint findings", "",
+  "| Severity | Check | Object | |", "|---|---|---|---|",
+  (.new_lint_findings[] | "| \(.severity | md) | `\(.id | md)` | \(.object // "" | md) | \(.title // "" | md) |"),
+  "") else empty end),
+(if (.cleanup // []) | length > 0 then (
+  "### Verification branches", "",
+  (.cleanup[] | "- `\(.branch | md)`: \(if .deleted then "deleted" elif .kept then "kept" else "⚠️ **not deleted** — its TTL (`\($ttl)`) expires it\(if (.error // "") != "" then ": \(.error | md)" else "" end)" end)"),
+  "") else empty end),
+"> Verifies this migration against the project'"'"'s Safe Copy baseline. It does not detect conflicts between migrations of parallel pull requests or agents against a changing production schema.",
+""'
+
+# Workflow annotations: error when the category blocks, warning when not.
+VERIFY_ANNOTATE_JQ='
+def esc: tostring | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+def rank: {critical: 3, warning: 2, info: 1}[.] // 0;
+(.policy.block_on // []) as $block | (.policy.fail_on // $fail_on) as $fo |
+def lvl($c): if $block | index($c) then "error" else "warning" end;
+(if $fo == "none" then 99 else ($fo | rank) end) as $min |
+(.reasons // []) as $why |
+(if (.categories // []) | index("fail") then "::\(lvl("fail")) title=PGRun verify::confirmed failure on PostgreSQL: \($why | map(select(test("exited"))) | (first // "the migration failed") | esc)" else empty end),
+(.schema_review.findings[]? | select((.severity | rank) >= $min) |
+  "::\(lvl("dangerous")) title=PGRun verify \(.id | esc | gsub("[:,]"; " "))::\(.object // "" | esc): \(.detail // "" | esc)\(if .advice then " — \(.advice | esc)" else "" end)"),
+(.schema_review.findings[]? | select((.severity | rank) < $min and .severity == "warning") |
+  "::warning title=PGRun verify \(.id | esc | gsub("[:,]"; " "))::\(.object // "" | esc): \(.detail // "" | esc)"),
+(if (.categories // []) | index("unsupported") then "::\(lvl("unsupported")) title=PGRun verify::unsupported on PGX: \(.pgx.error // ($why | join("; ")) | esc)" else empty end),
+(if (.categories // []) | index("incomplete") then "::\(lvl("incomplete")) title=PGRun verify::incomplete — the migration was not reviewed: \(.schema_review_skipped // ($why | join("; ")) | esc)" else empty end),
+(if (.categories // []) | index("error") then "::\(lvl("error")) title=PGRun verify::infrastructure error: \($why | join("; ") | esc)" else empty end),
+(.cleanup[]? | select((.deleted | not) and (.kept | not)) | "::warning title=PGRun verify::verification branch \(.branch | esc) could not be deleted; its TTL expires it")'
+
+verify_main() {
+  v_fail_on="${PGRUN_IN_VERIFY_FAIL_ON:-critical}"
+  v_block_on="${PGRUN_IN_VERIFY_BLOCK_ON:-$VERIFY_DEFAULT_BLOCK_ON}"; v_block_on="${v_block_on// /}"
+  local compare="${PGRUN_IN_VERIFY_COMPARE_PGX:-true}"
+  [ -n "${PGRUN_API_TOKEN:-}" ] || verify_refuse "no PGRun token: the \`token\` input is empty. A pull request from a fork gets no secrets — run PGRun CI only for branches of this repository, and store the token as the PGRUN_API_TOKEN secret."
+  [ "${GITHUB_EVENT_NAME:-}" = pull_request_target ] && verify_refuse "refusing to run on pull_request_target: it would hand PR code the PGRun token. Use pull_request."
+  # Verification runs the migration on a branch of the sanitized Safe Copy.
+  if [ "${PGRUN_IN_ALLOW_PUBLIC_REPOSITORY:-false}" != true ] && [ -f "${GITHUB_EVENT_PATH:-}" ] \
+     && [ "$(jq -r '.repository.private | if . == false then "false" else "" end' "$GITHUB_EVENT_PATH")" = false ]; then
+    verify_refuse "this repository is public: anyone can read its Actions logs, and verification runs your migration on a branch of the sanitized copy. Use a private repository, or set allow-public-repository: true to accept this."
+  fi
+  case "$v_fail_on" in critical|warning|none) ;; *) verify_refuse "verify-fail-on must be critical, warning or none (got: $v_fail_on)" ;; esac
+  if [ "$v_block_on" != none ]; then
+    local c; for c in ${v_block_on//,/ }; do
+      [[ " $VERIFY_CATEGORIES " == *" $c "* ]] || verify_refuse "verify-block-on: unknown category $c (use a comma list of: ${VERIFY_CATEGORIES// /, }; or none)"
+    done
+  fi
+  case "$compare" in true|false) ;; *) verify_refuse "verify-compare-pgx must be true or false" ;; esac
+  [[ "$ready_timeout" =~ ^[0-9]+$ ]] || verify_refuse "ready-timeout must be a number of seconds"
+  command -v jq > /dev/null || verify_refuse "jq is required (preinstalled on GitHub-hosted runners)"
+
+  v_dir=$(mktemp -d "$runtime/verify.XXXXXX"); chmod 700 "$v_dir"
+  v_report="$v_dir/report.json"
+  cd "$workdir"
+  framework=$(cat "$runtime/framework" 2>/dev/null || echo none)
+  [ "$framework_in" != auto ] && framework="$framework_in"
+  local cmd="${PGRUN_IN_VERIFY_COMMAND:-}"; [ -n "$cmd" ] || cmd=$(migrate_cmd)
+  [ -n "$cmd" ] || verify_refuse "no migration command to verify: set verify-command (or migrate-command)."
+  # A missing bundle would read as a failed migration: say what it is instead.
+  if [ "$framework" = rails ] && ! { command -v bundle > /dev/null && bundle check > /dev/null 2>&1; }; then
+    verify_refuse "the bundle is not installed. Keep setup-ruby: true (default), or run bundle install before this step."
+  fi
+
+  local why rc=0
+  if ! verify_cli; then
+    verify_synth "$(cat "$v_dir/why")"
+  else
+    local args=(bot verify)
+    [ -n "$project_in" ] && args+=("$project_in")
+    args+=(--json --fail-on "$v_fail_on" --block-on "$v_block_on" --ttl "$ttl" --timeout "${ready_timeout}s")
+    [ "$compare" = true ] && args+=(--compare-pgx)
+    # The migration gets DATABASE_URL from pgrun, never the PGRun token.
+    args+=(-- env -u PGRUN_API_TOKEN RAILS_ENV="$rails_env" bash -c "$cmd")
+    log "verifying the migration: $cmd (fail-on $v_fail_on, block-on $v_block_on$([ "$compare" = true ] && echo ', compared on PGX'))"
+    trap verify_on_signal INT TERM
+    bg pgrun "${args[@]}" > "$v_dir/stdout" 2> "$v_dir/stderr" || rc=$?
+    trap - INT TERM
+    # Migration output is the customer's: no workflow command in it may run.
+    local stop; stop=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+    echo "::group::pgrun bot verify output (exit $rc)"; echo "::stop-commands::$stop"
+    redact < "$v_dir/stderr"; echo "::$stop::"; echo "::endgroup::"
+    if jq -s -e 'length == 1 and (.[0] | type == "object" and .kind == "pgrun-verify"
+          and ((.version // "") | startswith("1.")) and (.verdict | type == "string")
+          and (.blocking | type == "boolean") and (.categories | type == "array"))' "$v_dir/stdout" > /dev/null 2>&1; then
+      # The report is kept for later steps: no URL in it, even from an error message.
+      jq 'walk(if type == "string" then gsub("postgres(ql)?://[^\\s\"]+"; "<url>") else . end)' "$v_dir/stdout" > "$v_report"
+      local blocking; blocking=$(jq -r '.blocking' "$v_report")
+      if { [ "$blocking" = true ] && [ "$rc" = 0 ]; } || { [ "$blocking" = false ] && [ "$rc" != 0 ]; }; then
+        echo "::warning title=PGRun verify::pgrun exited $rc but its report says blocking=$blocking; the report decides"
+      fi
+    else
+      local tail_err; tail_err=$(redact < "$v_dir/stderr" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-300)
+      case "$rc" in
+        2)   why="pgrun is not authenticated or not configured (exit 2)${tail_err:+: $tail_err}" ;;
+        64)  why="pgrun rejected the verify arguments (exit 64) — the CLI may be too old for pgrun-verify 1.1${tail_err:+: $tail_err}" ;;
+        127) why="pgrun could not be started (exit 127)" ;;
+        *)   why="pgrun exited $rc without a pgrun-verify 1.x JSON report${tail_err:+: $tail_err}" ;;
+      esac
+      verify_synth "$why"
+    fi
+  fi
+  rm -f "$v_dir/stdout"
+
+  local verdict blocking cats
+  verdict=$(jq -r '.verdict' "$v_report"); blocking=$(jq -r '.blocking' "$v_report")
+  cats=$(jq -r '.categories | join(",")' "$v_report")
+  { echo "verdict=$verdict"; echo "blocking=$blocking"; echo "categories=$cats"; echo "report=$v_report"; } >> "${GITHUB_OUTPUT:-/dev/null}"
+  jq -r --arg fail_on "$v_fail_on" --arg ttl "$ttl" "$VERIFY_SUMMARY_JQ" "$v_report" | redact >> "$summary"
+  jq -r --arg fail_on "$v_fail_on" "$VERIFY_ANNOTATE_JQ" "$v_report" | redact
+  log "verification: $verdict (categories: ${cats:-none}; blocking: $blocking) — report $v_report"
+  [ "$blocking" = true ] && exit 1
+  exit 0
+}
+
 # --------------------------------------------------------------------- main
 finish() {
   local code=$?
@@ -633,5 +871,6 @@ case "${1:-}" in
     rm -f "$runtime"/url_*
     [ -z "$(get summary_written)" ] && { [ -n "$(get result)" ] || record result CANCELLED; write_summary; record summary_written 1; }
     exit 0 ;;
-  *) echo "usage: pgrun-ci detect|run|cleanup" >&2; exit 64 ;;
+  verify) verify_main ;;
+  *) echo "usage: pgrun-ci detect|run|verify|cleanup" >&2; exit 64 ;;
 esac
