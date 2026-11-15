@@ -13,6 +13,10 @@ ci="$here/../lib/pgrun-ci"
 : "${RAILS_APP:?}" "${COPY_DB:?}" "${TEST_PG_URL:?}"
 export STUB_TEMPLATE_DB="$COPY_DB" PATH="$here/stub:$PATH"
 root=$(mktemp -d); pass=0; fail=0
+# Hermetic: never inherit the runner's own event file (on GitHub it describes THIS public
+# repository, and the public-repository guard would refuse every production-like run).
+echo '{"repository":{"private":true}}' > "$root/private_event.json"
+export GITHUB_EVENT_PATH="$root/private_event.json"
 export STUB_DIR="$root/stub"; mkdir -p "$STUB_DIR"
 jq -n '{token: "good", status: 200, body: {project: {name: "app"}, source: {postgres_version: "18.1"},
   protect: {status: "active", policy_version: 1}, safe_copy: {status: "ready", updated_at: (now | todate), policy_version: 1},

@@ -9,6 +9,10 @@ admin="${TEST_PG_URL:?TEST_PG_URL is required}"
 export TEST_PG_URL="$admin"
 pass=0; fail=0
 root=$(mktemp -d)
+# Hermetic: never inherit the runner's own event file (on GitHub it describes THIS public
+# repository, and the public-repository guard would refuse every production-like run).
+echo '{"repository":{"private":true}}' > "$root/private_event.json"
+export GITHUB_EVENT_PATH="$root/private_event.json"
 api_pid=""
 cleanup_all() {
   [ -n "$api_pid" ] && kill "$api_pid" 2>/dev/null
