@@ -44,6 +44,9 @@ doc "$root/error.json" error '["error"]' '.verification = {engine: "", requested
 
 # run_verify <name> [VAR=value ...] — the verify step as the composite runs it.
 # RUNNER_TEMP is shared by default (one job); outputs and summary are per run.
+# Hermetic: never inherit the runner's own event (on GitHub it describes THIS public repository,
+# and the public-repository guard would refuse every run). Tests of the guard pass their own.
+echo '{"repository":{"private":true}}' > "$root/private.json"
 run_verify() {
   local name="$1"; shift
   local d="$root/run-$name"; mkdir -p "$d"
@@ -51,7 +54,7 @@ run_verify() {
   out=$(cd "$root/app" && env PATH="$FAKE_PATH" RUNNER_TEMP="${SHARED_TEMP:-$root/temp}" \
         GITHUB_OUTPUT="$d/out" GITHUB_STEP_SUMMARY="$d/summary.md" GITHUB_EVENT_NAME=pull_request \
         PGRUN_API_TOKEN="$TOKEN" PGRUN_IN_API_URL=https://app.pgrun.dev PGRUN_IN_FRAMEWORK=none \
-        PGRUN_IN_MIGRATE_COMMAND='bin/migrate' "$@" "$ci" verify 2>&1)
+        PGRUN_IN_MIGRATE_COMMAND='bin/migrate' GITHUB_EVENT_PATH="$root/private.json" "$@" "$ci" verify 2>&1)
   code=$?
   summary=$(cat "$d/summary.md" 2>/dev/null)
   calls=$(cat "$d/calls" 2>/dev/null)
